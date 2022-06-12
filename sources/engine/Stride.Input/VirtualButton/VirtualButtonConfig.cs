@@ -54,6 +54,36 @@ namespace Stride.Input
             return value;
         }
 
+        public virtual bool IsPressed(InputManager inputManager, object name)
+        {
+            bool value = false;
+            List<VirtualButtonBinding> bindingsPerName;
+            if (mapBindings.TryGetValue(name, out bindingsPerName))
+            {
+                foreach (var virtualButtonBinding in bindingsPerName)
+                {
+                    value = virtualButtonBinding.Button.IsPressed(inputManager);
+                }
+            }
+
+            return value;
+        }
+
+        public virtual bool IsReleased(InputManager inputManager, object name)
+        {
+            bool value = false;
+            List<VirtualButtonBinding> bindingsPerName;
+            if(mapBindings.TryGetValue(name, out bindingsPerName))
+            {
+                foreach (var virtualButtonBinding in bindingsPerName)
+                {
+                    value = virtualButtonBinding.Button.IsReleased(inputManager);
+                }
+            }
+
+            return value;
+        }
+
         private void Bindings_CollectionChanged(object sender, TrackingCollectionChangedEventArgs e)
         {
             var virtualButtonBinding = (VirtualButtonBinding)e.Item;

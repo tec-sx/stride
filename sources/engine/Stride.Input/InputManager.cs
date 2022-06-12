@@ -36,6 +36,8 @@ namespace Stride.Input
 
         private readonly Dictionary<GestureConfig, GestureRecognizer> gestureConfigToRecognizer = new Dictionary<GestureConfig, GestureRecognizer>();
         private readonly List<Dictionary<object, float>> virtualButtonValues = new List<Dictionary<object, float>>();
+        private readonly List<Dictionary<object, bool>> virtualButtonsPressed = new List<Dictionary<object, bool>>();
+        private readonly List<Dictionary<object, bool>> virtualButtonsReleased = new List<Dictionary<object, bool>>();
 
         // Mapping of device guid to device
         private readonly Dictionary<Guid, IInputDevice> devicesById = new Dictionary<Guid, IInputDevice>();
@@ -481,6 +483,30 @@ namespace Stride.Input
             return value;
         }
 
+        public virtual bool VirtualButtonIsPressed(int configIndex, object bindingName)
+        {
+            if (VirtualButtonConfigSet == null || configIndex < 0 || configIndex >= virtualButtonsPressed.Count)
+            {
+                return false;
+            }
+
+            bool value;
+            virtualButtonsPressed[configIndex].TryGetValue(bindingName, out value);
+            return value;
+        }
+
+        public virtual bool VirtualButtonIsReleased(int configIndex, object bindingName)
+        {
+            if (VirtualButtonConfigSet == null || configIndex < 0 || configIndex >= virtualButtonsReleased.Count)
+            {
+                return false;
+            }
+
+            bool value;
+            virtualButtonsReleased[configIndex].TryGetValue(bindingName, out value);
+            return value;
+        }
+
         /// <summary>
         /// Pause all input sources.
         /// </summary>
@@ -910,6 +936,10 @@ namespace Stride.Input
                     var config = VirtualButtonConfigSet[i];
 
                     Dictionary<object, float> mapNameToValue;
+                    Dictionary<object, bool> mapNameToIsPressed;
+                    Dictionary<object, bool> mapNameToIsReleased;
+
+                    // Map virtual button values
                     if (i == virtualButtonValues.Count)
                     {
                         mapNameToValue = new Dictionary<object, float>();
@@ -920,13 +950,40 @@ namespace Stride.Input
                         mapNameToValue = virtualButtonValues[i];
                     }
 
-                    mapNameToValue.Clear();
+                    // Map virtual button is pressed
+                    if (i == virtualButtonsPressed.Count)
+                    {
+                        mapNameToIsPressed = new Dictionary<object, bool>();
+                        virtualButtonsPressed.Add(mapNameToIsPressed);
+                    }
+                    else
+                    {
+                        mapNameToIsPressed = virtualButtonsPressed[i];
+                    }
 
+                    // Map virtual button is released
+                    if (i == virtualButtonsReleased.Count)
+                    {
+                        mapNameToIsReleased = new Dictionary<object, bool>();
+                        virtualButtonsReleased.Add(mapNameToIsReleased);
+                    }
+                    else
+                    {
+                        mapNameToIsReleased = virtualButtonsReleased[i];
+                    }
+
+                    mapNameToValue.Clear();
+                    mapNameToIsReleased.Clear();
+                    mapNameToIsPressed.Clear();
+
+                    // Update values
                     if (config != null)
                     {
                         foreach (var name in config.BindingNames)
                         {
                             mapNameToValue[name] = config.GetValue(this, name);
+                            mapNameToIsPressed[name] = config.IsPressed(this, name);
+                            mapNameToIsReleased[name] = config.IsReleased(this, name);
                         }
                     }
                 }
