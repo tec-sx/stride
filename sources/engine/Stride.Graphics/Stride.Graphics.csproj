@@ -46,6 +46,8 @@
     <ProjectReference Include="..\Stride.Native\Stride.Native.csproj" />
     <ProjectReference Include="..\Stride.Shaders\Stride.Shaders.csproj" />
     <ProjectReference Include="..\Stride\Stride.csproj" />
+    <PackageReference Include="Silk.NET.Direct3D12" Version="2.15.0" />
+    <PackageReference Include="Silk.NET.DXGI" Version="2.15.0" />
     <PackageReference Include="System.Memory" Version="4.5.4" />
     <PackageReference Include="SharpDX.Direct3D11" Version="4.2.0" Condition="'$(TargetFramework)' == '$(StrideFramework)' Or '$(TargetFramework)' == '$(StrideFrameworkUWP)'" />
     <PackageReference Include="SharpDX.Direct3D12" Version="4.2.0" Condition="'$(TargetFramework)' == '$(StrideFramework)'" />

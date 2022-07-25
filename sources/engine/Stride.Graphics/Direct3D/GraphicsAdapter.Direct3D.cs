@@ -27,6 +27,8 @@ using SharpDX;
 using SharpDX.Direct3D;
 using SharpDX.Direct3D11;
 using SharpDX.DXGI;
+using Silk.NET.Core.Native;
+using Silk.NET.DXGI;
 using Stride.Core;
 using ComponentBase = Stride.Core.ComponentBase;
 using Utilities = Stride.Core.Utilities;
@@ -41,7 +43,7 @@ namespace Stride.Graphics
     /// <unmanaged-short>IDXGIAdapter1</unmanaged-short>
     public partial class GraphicsAdapter
     {
-        private readonly Adapter1 adapter;
+        private readonly ComPtr<IDXGIAdapter1> adapter;
         private readonly int adapterOrdinal;
         private readonly AdapterDescription1 description;
 
@@ -103,13 +105,7 @@ namespace Stride.Graphics
             }
         }
 
-        internal Adapter1 NativeAdapter
-        {
-            get
-            {
-                return adapter;
-            }
-        }
+        internal ComPtr<IDXGIAdapter1> NativeAdapter => adapter;
 
         /// <summary>
         /// Tests to see if the adapter supports the requested profile.

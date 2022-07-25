@@ -4,16 +4,15 @@
 using System;
 using System.Collections.Generic;
 
-using SharpDX;
-using SharpDX.DXGI;
-using SharpDX.Direct3D12;
+using Silk.NET.DXGI;
+using Silk.NET.Direct3D12;
 using Stride.Core.Mathematics;
 
 namespace Stride.Graphics
 {
-    public partial class Buffer
+    public unsafe partial class Buffer
     {
-        private SharpDX.Direct3D12.ResourceDescription nativeDescription;
+        private ResourceDesc nativeDescription;
         internal long GPUVirtualAddress;
         
         /// <summary>
@@ -73,20 +72,20 @@ namespace Stride.Graphics
         public void Recreate(IntPtr dataPointer)
         {
             // TODO D3D12 where should that go longer term? should it be precomputed for future use? (cost would likely be additional check on SetDescriptorSets/Draw)
-            NativeResourceState = ResourceStates.Common;
+            NativeResourceState = ResourceStates.ResourceStateCommon;
             var bufferFlags = bufferDescription.BufferFlags;
 
             if ((bufferFlags & BufferFlags.ConstantBuffer) != 0)
-                NativeResourceState |= ResourceStates.VertexAndConstantBuffer;
+                NativeResourceState |= ResourceStates.ResourceStateVertexAndConstantBuffer;
 
             if ((bufferFlags & BufferFlags.IndexBuffer) != 0)
-                NativeResourceState |= ResourceStates.IndexBuffer;
+                NativeResourceState |= ResourceStates.ResourceStateIndexBuffer;
 
             if ((bufferFlags & BufferFlags.VertexBuffer) != 0)
-                NativeResourceState |= ResourceStates.VertexAndConstantBuffer;
+                NativeResourceState |= ResourceStates.ResourceStateVertexAndConstantBuffer;
 
             if ((bufferFlags & BufferFlags.ShaderResource) != 0)
-                NativeResourceState |= ResourceStates.PixelShaderResource | ResourceStates.NonPixelShaderResource;
+                NativeResourceState |= ResourceStates.ResourceStatePixelShaderResource | ResourceStates.ResourceStateNonPixelShaderResource;
 
             if ((bufferFlags & BufferFlags.StructuredBuffer) != 0)
             {
@@ -95,21 +94,21 @@ namespace Stride.Graphics
             }
 
             if ((bufferFlags & BufferFlags.ArgumentBuffer) == BufferFlags.ArgumentBuffer)
-                NativeResourceState |= ResourceStates.IndirectArgument;
+                NativeResourceState |= ResourceStates.ResourceStateIndirectArgument;
 
-            var heapType = HeapType.Default;
+            var heapType = HeapType.HeapTypeDefault;
             if (Usage == GraphicsResourceUsage.Staging)
             {
                 if (dataPointer != IntPtr.Zero)
                     throw new NotImplementedException("D3D12: Staging buffers can't be created with initial data.");
 
-                heapType = HeapType.Readback;
-                NativeResourceState = ResourceStates.CopyDestination;
+                heapType = HeapType.HeapTypeReadback;
+                NativeResourceState = ResourceStates.ResourceStateCopyDest;
             }
             else if (Usage == GraphicsResourceUsage.Dynamic)
             {
-                heapType = HeapType.Upload;
-                NativeResourceState = ResourceStates.GenericRead;
+                heapType = HeapType.HeapTypeUpload;
+                NativeResourceState = ResourceStates.ResourceStateGenericRead;
             }
 
             // TODO D3D12 move that to a global allocator in bigger committed resources
@@ -118,7 +117,7 @@ namespace Stride.Graphics
 
             if (dataPointer != IntPtr.Zero)
             {
-                if (heapType == HeapType.Upload)
+                if (heapType == HeapType.HeapTypeUpload)
                 {
                     var uploadMemory = NativeResource.Map(0);
                     Utilities.CopyMemory(uploadMemory, dataPointer, SizeInBytes);
@@ -128,7 +127,7 @@ namespace Stride.Graphics
                 {
                     // Copy data in upload heap for later copy
                     // TODO D3D12 move that to a shared upload heap
-                    SharpDX.Direct3D12.Resource uploadResource;
+                    ID3D12Resource* uploadResource;
                     int uploadOffset;
                     var uploadMemory = GraphicsDevice.AllocateUploadBuffer(SizeInBytes, out uploadResource, out uploadOffset);
                     Utilities.CopyMemory(uploadMemory, dataPointer, SizeInBytes);
@@ -166,22 +165,22 @@ namespace Stride.Graphics
             var srv = new CpuDescriptorHandle();
             if ((ViewFlags & BufferFlags.ShaderResource) != 0)
             {
-                var description = new ShaderResourceViewDescription
+                var description = new ShaderResourceViewDesc
                 {
                     Shader4ComponentMapping = 0x00001688,
-                    Format = (SharpDX.DXGI.Format)viewFormat,
-                    Dimension = SharpDX.Direct3D12.ShaderResourceViewDimension.Buffer,
+                    Format = (Format)viewFormat,
+                    Dimension = SrvDimension.SrvDimensionBuffer,
                     Buffer =
                     {
                         ElementCount = this.ElementCount,
                         FirstElement = 0,
-                        Flags = BufferShaderResourceViewFlags.None,
+                        Flags = BufferSrvFlags.BufferSrvFlagNone,
                         StructureByteStride = StructureByteStride,
                     }
                 };
 
                 if (((ViewFlags & BufferFlags.RawBuffer) == BufferFlags.RawBuffer))
-                    description.Buffer.Flags |= BufferShaderResourceViewFlags.Raw;
+                    description.Buffer.Flags |= BufferSrvFlags.BufferSrvFlagRaw;
 
                 srv = GraphicsDevice.ShaderResourceViewAllocator.Allocate(1);
                 NativeDevice.CreateShaderResourceView(NativeResource, description, srv);
@@ -194,7 +193,7 @@ namespace Stride.Graphics
             var uav = new CpuDescriptorHandle();
             if ((ViewFlags & BufferFlags.UnorderedAccess) != 0)
             {
-                var description = new UnorderedAccessViewDescription
+                var description = new UnorderedAccessViewDesc
                 {
                     Format = (SharpDX.DXGI.Format)viewFormat,
                     Dimension = SharpDX.Direct3D12.UnorderedAccessViewDimension.Buffer,
@@ -249,18 +248,18 @@ namespace Stride.Graphics
             }
         }
 
-        private static SharpDX.Direct3D12.ResourceDescription ConvertToNativeDescription(GraphicsDevice graphicsDevice, BufferDescription bufferDescription)
+        private static ResourceDescription ConvertToNativeDescription(GraphicsDevice graphicsDevice, BufferDescription bufferDescription)
         {
-            var flags = ResourceFlags.None;
+            var flags = ResourceFlags.ResourceFlagNone;
             var size = bufferDescription.SizeInBytes;
 
             // TODO D3D12 for now, ensure size is multiple of ConstantBufferDataPlacementAlignment (for cbuffer views)
             size = MathUtil.AlignUp(size, graphicsDevice.ConstantBufferDataPlacementAlignment);
 
             if ((bufferDescription.BufferFlags & BufferFlags.UnorderedAccess) != 0)
-                flags |= ResourceFlags.AllowUnorderedAccess;
+                flags |= ResourceFlags.ResourceFlagAllowUnorderedAccess;
 
-            return SharpDX.Direct3D12.ResourceDescription.Buffer(size, flags);
+            return ResourceDescription.Buffer(size, flags);
         }
     }
 } 

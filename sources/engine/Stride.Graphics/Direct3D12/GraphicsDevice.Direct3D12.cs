@@ -6,35 +6,44 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
-using SharpDX.Direct3D12;
+using Silk.NET.Core.Native;
+using Silk.NET.Direct3D12;
+using Silk.NET.DXGI;
 using Stride.Core.Collections;
 using Stride.Core.Threading;
+using Stride.Graphics.Direct3D;
+using Stride.Graphics.Direct3D12;
 
 namespace Stride.Graphics
 {
-    public partial class GraphicsDevice
+    public unsafe partial class GraphicsDevice
     {
         // D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT (not exposed by SharpDX)
         internal readonly int ConstantBufferDataPlacementAlignment = 256;
 
+        private D3D12 d3d12;
+        private DXGI dxgi;
+
         private const GraphicsPlatform GraphicPlatform = GraphicsPlatform.Direct3D12;
 
         internal readonly ConcurrentPool<List<GraphicsResource>> StagingResourceLists = new ConcurrentPool<List<GraphicsResource>>(() => new List<GraphicsResource>());
-        internal readonly ConcurrentPool<List<DescriptorHeap>> DescriptorHeapLists = new ConcurrentPool<List<DescriptorHeap>>(() => new List<DescriptorHeap>());
+        internal readonly ConcurrentPool<List<ID3D12DescriptorHeap>> DescriptorHeapLists = new (() => new List<ID3D12DescriptorHeap>());
 
         private bool simulateReset = false;
         private string rendererName;
 
-        private SharpDX.Direct3D12.Device nativeDevice;
-        internal CommandQueue NativeCommandQueue;
+        private ComPtr<ID3D12Device> nativeDevice;
+        internal ComPtr<ID3D12CommandQueue> NativeCommandQueue;
+
+        internal CommandQueue CommandQueue;
 
         internal GraphicsProfile RequestedProfile;
-        internal SharpDX.Direct3D.FeatureLevel CurrentFeatureLevel;
+        internal D3DFeatureLevel CurrentFeatureLevel;
 
-        internal CommandQueue NativeCopyCommandQueue;
-        internal CommandAllocator NativeCopyCommandAllocator;
-        internal GraphicsCommandList NativeCopyCommandList;
-        private Fence nativeCopyFence;
+        internal ComPtr<ID3D12CommandQueue> NativeCopyCommandQueue;
+        internal ComPtr<ID3D12CommandAllocator> NativeCopyCommandAllocator;
+        internal ComPtr<ID3D12GraphicsCommandList> NativeCopyCommandList;
+        private ID3D12Fence nativeCopyFence;
         private long nextCopyFenceValue = 1;
 
         internal CommandAllocatorPool CommandAllocators;
@@ -49,22 +58,22 @@ namespace Stride.Graphics
         internal DescriptorAllocator DepthStencilViewAllocator;
         internal DescriptorAllocator RenderTargetViewAllocator;
 
-        private SharpDX.Direct3D12.Resource nativeUploadBuffer;
+        private ComPtr<ID3D12Resource> nativeUploadBuffer;
         private IntPtr nativeUploadBufferStart;
         private int nativeUploadBufferOffset;
 
         internal int SrvHandleIncrementSize;
         internal int SamplerHandleIncrementSize;
 
-        private Fence nativeFence;
+        private ID3D12Fence nativeFence;
         private long lastCompletedFence;
-        internal long NextFenceValue = 1;
+        internal ulong NextFenceValue = 1;
         private AutoResetEvent fenceEvent = new AutoResetEvent(false);
 
         // Temporary or destroyed resources kept around until the GPU doesn't need them anymore
         internal Queue<KeyValuePair<long, object>> TemporaryResources = new Queue<KeyValuePair<long, object>>();
 
-        private readonly FastList<SharpDX.Direct3D12.CommandList> nativeCommandLists = new FastList<SharpDX.Direct3D12.CommandList>();
+        private readonly FastList<ComPtr<ID3D12GraphicsCommandList>> nativeCommandLists = new ();
 
         /// <summary>
         /// The tick frquency of timestamp queries in Hertz.
@@ -85,38 +94,18 @@ namespace Stride.Graphics
                     return GraphicsDeviceStatus.Reset;
                 }
 
-                var result = NativeDevice.DeviceRemovedReason;
-                if (result == SharpDX.DXGI.ResultCode.DeviceRemoved)
-                {
-                    return GraphicsDeviceStatus.Removed;
-                }
+                DXGIError result = (DXGIError)NativeDevice.Get().GetDeviceRemovedReason();
 
-                if (result == SharpDX.DXGI.ResultCode.DeviceReset)
+                return result switch
                 {
-                    return GraphicsDeviceStatus.Reset;
-                }
-
-                if (result == SharpDX.DXGI.ResultCode.DeviceHung)
-                {
-                    return GraphicsDeviceStatus.Hung;
-                }
-
-                if (result == SharpDX.DXGI.ResultCode.DriverInternalError)
-                {
-                    return GraphicsDeviceStatus.InternalError;
-                }
-
-                if (result == SharpDX.DXGI.ResultCode.InvalidCall)
-                {
-                    return GraphicsDeviceStatus.InvalidCall;
-                }
-
-                if (result.Code < 0)
-                {
-                    return GraphicsDeviceStatus.Reset;
-                }
-
-                return GraphicsDeviceStatus.Normal;
+                    DXGIError.DeviceRemoved => GraphicsDeviceStatus.Removed,
+                    DXGIError.DeviceReset => GraphicsDeviceStatus.Reset,
+                    DXGIError.DeviceHung => GraphicsDeviceStatus.Hung,
+                    DXGIError.DriverInternalError => GraphicsDeviceStatus.InternalError,
+                    DXGIError.InvalidCall => GraphicsDeviceStatus.InvalidCall,
+                    < 0 => GraphicsDeviceStatus.Reset,
+                    _ => GraphicsDeviceStatus.Normal
+                };
             }
         }
 
@@ -124,13 +113,7 @@ namespace Stride.Graphics
         ///     Gets the native device.
         /// </summary>
         /// <value>The native device.</value>
-        internal SharpDX.Direct3D12.Device NativeDevice
-        {
-            get
-            {
-                return nativeDevice;
-            }
-        }
+        internal ComPtr<ID3D12Device> NativeDevice => nativeDevice;
 
         /// <summary>
         ///     Marks context as active on the current thread.
@@ -162,7 +145,7 @@ namespace Stride.Graphics
         /// <param name="commandList">The deferred command list.</param>
         public void ExecuteCommandList(CompiledCommandList commandList)
         {
-            ExecuteCommandListInternal(commandList);
+            ulong fenceValue = ExecuteCommandListInternal(commandList);
         }
 
         /// <summary>
@@ -172,22 +155,35 @@ namespace Stride.Graphics
         /// <param name="commandLists">The deferred command lists.</param>
         public void ExecuteCommandLists(int count, CompiledCommandList[] commandLists)
         {
-            if (commandLists == null) throw new ArgumentNullException(nameof(commandLists));
-            if (count > commandLists.Length) throw new ArgumentOutOfRangeException(nameof(count));
+            if (commandLists == null)
+            {
+                throw new ArgumentNullException(nameof(commandLists));
+            }
 
-            var fenceValue = NextFenceValue++;
+            if (count > commandLists.Length)
+            {
+                throw new ArgumentOutOfRangeException(nameof(count));
+            }
+
+            ulong fenceValue = NextFenceValue++;
 
             // Recycle resources
             for (int index = 0; index < count; index++)
             {
-                var commandList = commandLists[index];
+                CompiledCommandList commandList = commandLists[index];
+
                 nativeCommandLists.Add(commandList.NativeCommandList);
                 RecycleCommandListResources(commandList, fenceValue);
             }
 
             // Submit and signal fence
-            NativeCommandQueue.ExecuteCommandLists(count, nativeCommandLists.Items);
-            NativeCommandQueue.Signal(nativeFence, fenceValue);
+            var ppCommandLists = stackalloc ComPtr<ID3D12CommandList>[count]
+            {
+                (ID3D12CommandList*)nativeCommandLists.To
+            };
+
+            NativeCommandQueue.Get().ExecuteCommandLists(count, nativeCommandLists.Items);
+            NativeCommandQueue.Get().Signal(Fence, fenceValue);
 
             ReleaseTemporaryResources();
 
@@ -208,6 +204,37 @@ namespace Stride.Graphics
             return rendererName;
         }
 
+
+        internal void RecycleCommandListResources(CompiledCommandList commandList, ulong fenceValue)
+        {
+            // Set fence on staging textures
+            foreach (var stagingResource in commandList.StagingResources)
+            {
+                stagingResource.StagingFenceValue = fenceValue;
+            }
+
+            StagingResourceLists.Release(commandList.StagingResources);
+            commandList.StagingResources.Clear();
+
+            // Recycle resources
+            foreach (var heap in commandList.SrvHeaps)
+            {
+                SrvHeaps.RecycleObject(fenceValue, heap);
+            }
+            commandList.SrvHeaps.Clear();
+            DescriptorHeapLists.Release(commandList.SrvHeaps);
+
+            foreach (var heap in commandList.SamplerHeaps)
+            {
+                SamplerHeaps.RecycleObject(fenceValue, heap);
+            }
+            commandList.SamplerHeaps.Clear();
+            DescriptorHeapLists.Release(commandList.SamplerHeaps);
+
+            commandList.Builder.NativeCommandLists.Enqueue(commandList.NativeCommandList);
+            CommandAllocators.RecycleObject(fenceValue, commandList.NativeCommandAllocator);
+        }
+
         /// <summary>
         ///     Initializes the specified device.
         /// </summary>
@@ -216,13 +243,18 @@ namespace Stride.Graphics
         /// <param name="windowHandle">The window handle.</param>
         private void InitializePlatformDevice(GraphicsProfile[] graphicsProfiles, DeviceCreationFlags deviceCreationFlags, object windowHandle)
         {
-            if (nativeDevice != null)
+            d3d12 = D3D12.GetApi();
+            dxgi = DXGI.GetApi();
+
+            if (nativeDevice.Handle != null)
             {
                 // Destroy previous device
                 ReleaseDevice();
             }
 
-            rendererName = Adapter.NativeAdapter.Description.Description;
+            AdapterDesc* pDesc = null;
+            Adapter.NativeAdapter.Get().GetDesc(pDesc);
+            rendererName = SilkMarshal.PtrToString((nint)pDesc->Description);
 
             // Profiling is supported through pix markers
             IsProfilingSupported = true;
@@ -231,23 +263,46 @@ namespace Stride.Graphics
             IsDeferred = true;
 
             bool isDebug = (deviceCreationFlags & DeviceCreationFlags.Debug) != 0;
+
             if (isDebug)
             {
-                SharpDX.Direct3D12.DebugInterface.Get().EnableDebugLayer();
+                using ComPtr<ID3D12Debug> debugController = null;
+                Guid iid = ID3D12Debug.Guid;
+                int hResult = d3d12.GetDebugInterface(&iid, (void**)&debugController);
+
+                if (HResult.IndicatesSuccess(hResult))
+                {
+                    debugController.Get().EnableDebugLayer();
+                }
+                else
+                {
+                    isDebug = false;
+                }
             }
 
             // Create Device D3D12 with feature Level based on profile
             for (int index = 0; index < graphicsProfiles.Length; index++)
             {
-                var graphicsProfile = graphicsProfiles[index];
+                GraphicsProfile graphicsProfile = graphicsProfiles[index];
                 try
                 {
                     // D3D12 supports only feature level 11+
-                    var level = graphicsProfile.ToFeatureLevel();
-                    if (level < SharpDX.Direct3D.FeatureLevel.Level_11_0)
-                        level = SharpDX.Direct3D.FeatureLevel.Level_11_0;
+                    D3DFeatureLevel level = graphicsProfile.ToFeatureLevel();
 
-                    nativeDevice = new SharpDX.Direct3D12.Device(Adapter.NativeAdapter, level);
+                    if (level < D3DFeatureLevel.D3DFeatureLevel110)
+                    {
+                        level = D3DFeatureLevel.D3DFeatureLevel110;
+                    }
+
+                    ID3D12Device* d3dDevice;
+                    Guid deviceIID = ID3D12Device.Guid;
+                    D3DFeatureLevel minFeatureLevel = D3DFeatureLevel.D3DFeatureLevel110;
+                    IUnknown* adapter = (IUnknown*)Adapter.NativeAdapter.GetAddressOf();
+                    int deviceHResult = d3d12.CreateDevice(adapter, minFeatureLevel, &deviceIID, (void**)&d3dDevice);
+                    
+                    SilkMarshal.ThrowHResult(deviceHResult);
+
+                    nativeDevice = d3dDevice;
 
                     RequestedProfile = graphicsProfile;
                     CurrentFeatureLevel = level;
@@ -261,8 +316,13 @@ namespace Stride.Graphics
             }
 
             // Describe and create the command queue.
-            var queueDesc = new SharpDX.Direct3D12.CommandQueueDescription(SharpDX.Direct3D12.CommandListType.Direct);
-            NativeCommandQueue = nativeDevice.CreateCommandQueue(queueDesc);
+            CommandQueueDesc queueDesc = new (CommandListType.CommandListTypeDirect);
+            Guid commandQuquqIID = ID3D12CommandQueue.Guid;
+            ID3D12CommandQueue** pCommandQueue = NativeCommandQueue.GetAddressOf();
+            int commandQueueHResult = nativeDevice.Get().CreateCommandQueue(&queueDesc, &commandQuquqIID, (void**)pCommandQueue);
+
+            SilkMarshal.ThrowHResult(commandQueueHResult);
+
             //queueDesc.Type = CommandListType.Copy;
             NativeCopyCommandQueue = nativeDevice.CreateCommandQueue(queueDesc);
             TimestampFrequency = NativeCommandQueue.TimestampFrequency;
@@ -461,73 +521,6 @@ namespace Stride.Graphics
         {
         }
 
-        internal long ExecuteCommandListInternal(CompiledCommandList commandList)
-        {
-            var fenceValue = NextFenceValue++;
-
-            // Submit and signal fence
-            NativeCommandQueue.ExecuteCommandList(commandList.NativeCommandList);
-            NativeCommandQueue.Signal(nativeFence, fenceValue);
-
-            // Recycle resources
-            RecycleCommandListResources(commandList, fenceValue);
-
-            return fenceValue;
-        }
-
-        private void RecycleCommandListResources(CompiledCommandList commandList, long fenceValue)
-        {
-            // Set fence on staging textures
-            foreach (var stagingResource in commandList.StagingResources)
-            {
-                stagingResource.StagingFenceValue = fenceValue;
-            }
-
-            StagingResourceLists.Release(commandList.StagingResources);
-            commandList.StagingResources.Clear();
-
-            // Recycle resources
-            foreach (var heap in commandList.SrvHeaps)
-            {
-                SrvHeaps.RecycleObject(fenceValue, heap);
-            }
-            commandList.SrvHeaps.Clear();
-            DescriptorHeapLists.Release(commandList.SrvHeaps);
-
-            foreach (var heap in commandList.SamplerHeaps)
-            {
-                SamplerHeaps.RecycleObject(fenceValue, heap);
-            }
-            commandList.SamplerHeaps.Clear();
-            DescriptorHeapLists.Release(commandList.SamplerHeaps);
-
-            commandList.Builder.NativeCommandLists.Enqueue(commandList.NativeCommandList);
-            CommandAllocators.RecycleObject(fenceValue, commandList.NativeCommandAllocator);
-        }
-
-        internal bool IsFenceCompleteInternal(long fenceValue)
-        {
-            // Try to avoid checking the fence if possible
-            if (fenceValue > lastCompletedFence)
-                lastCompletedFence = Math.Max(lastCompletedFence, nativeFence.CompletedValue); // Protect against race conditions
-
-            return fenceValue <= lastCompletedFence;
-        }
-
-        internal void WaitForFenceInternal(long fenceValue)
-        {
-            if (IsFenceCompleteInternal(fenceValue))
-                return;
-
-            // TODO D3D12 in case of concurrency, this lock could end up blocking too long a second thread with lower fenceValue then first one
-            lock (nativeFence)
-            {
-                nativeFence.SetEventOnCompletion(fenceValue, fenceEvent.SafeWaitHandle.DangerousGetHandle());
-                fenceEvent.WaitOne();
-                lastCompletedFence = fenceValue;
-            }
-        }
-
         internal void TagResource(GraphicsResourceLink resourceLink)
         {
             var texture = resourceLink.Resource as Texture;
@@ -544,165 +537,6 @@ namespace Stride.Graphics
                 // Increase the reference count until GPU is done with the resource
                 resourceLink.ReferenceCount++;
                 TemporaryResources.Enqueue(new KeyValuePair<long, object>(NextFenceValue, resourceLink));
-            }
-        }
-
-        internal abstract class ResourcePool<T> : IDisposable where T : Pageable
-        {
-            protected readonly GraphicsDevice GraphicsDevice;
-            private readonly Queue<KeyValuePair<long, T>> liveObjects = new Queue<KeyValuePair<long, T>>();
-
-            protected ResourcePool(GraphicsDevice graphicsDevice)
-            {
-                GraphicsDevice = graphicsDevice;
-            }
-
-            public void Dispose()
-            {
-                lock (liveObjects)
-                {
-                    foreach (var liveObject in liveObjects)
-                    {
-                        liveObject.Value.Dispose();
-                    }
-                    liveObjects.Clear();
-                }
-            }
-
-            public T GetObject()
-            {
-                // TODO D3D12: SpinLock
-                lock (liveObjects)
-                {
-                    // Check if first allocator is ready for reuse
-                    if (liveObjects.Count > 0)
-                    {
-                        var firstAllocator = liveObjects.Peek();
-                        if (firstAllocator.Key <= GraphicsDevice.nativeFence.CompletedValue)
-                        {
-                            liveObjects.Dequeue();
-                            ResetObject(firstAllocator.Value);
-
-                            if (firstAllocator.Value == null)
-                            {
-                                
-                            }
-
-                            return firstAllocator.Value;
-                        }
-                    }
-
-                    return CreateObject();
-                }
-            }
-
-            protected abstract T CreateObject();
-
-            protected abstract void ResetObject(T obj);
-
-            public void RecycleObject(long fenceValue, T obj)
-            {
-                // TODO D3D12: SpinLock
-                lock (liveObjects)
-                {
-                    liveObjects.Enqueue(new KeyValuePair<long, T>(fenceValue, obj));
-                }
-            }
-        }
-
-        internal class CommandAllocatorPool : ResourcePool<CommandAllocator>
-        {
-            public CommandAllocatorPool(GraphicsDevice graphicsDevice) : base(graphicsDevice)
-            {
-            }
-
-            protected override CommandAllocator CreateObject()
-            {
-                // No allocator ready to be used, let's create a new one
-               return GraphicsDevice.NativeDevice.CreateCommandAllocator(CommandListType.Direct);
-            }
-
-            protected override void ResetObject(CommandAllocator obj)
-            {
-                obj.Reset();
-            }
-        }
-
-        internal class HeapPool : ResourcePool<DescriptorHeap>
-        {
-            private readonly int heapSize;
-            private readonly DescriptorHeapType heapType;
-
-            public HeapPool(GraphicsDevice graphicsDevice, int heapSize, DescriptorHeapType heapType) : base(graphicsDevice)
-            {
-                this.heapSize = heapSize;
-                this.heapType = heapType;
-            }
-
-            protected override DescriptorHeap CreateObject()
-            {
-                // No allocator ready to be used, let's create a new one
-                return GraphicsDevice.NativeDevice.CreateDescriptorHeap(new DescriptorHeapDescription
-                {
-                    DescriptorCount = heapSize,
-                    Flags = DescriptorHeapFlags.ShaderVisible,
-                    Type = heapType,
-                });
-            }
-
-            protected override void ResetObject(DescriptorHeap obj)
-            {
-            }
-        }
-
-        /// <summary>
-        /// Allocate descriptor handles. For now a simple bump alloc, but at some point we will have to make a real allocator with free
-        /// </summary>
-        internal class DescriptorAllocator : IDisposable
-        {
-            private const int DescriptorPerHeap = 256;
-
-            private GraphicsDevice device;
-            private DescriptorHeapType descriptorHeapType;
-            private DescriptorHeap currentHeap;
-            private CpuDescriptorHandle currentHandle;
-            private int remainingHandles;
-            private readonly int descriptorSize;
-
-            public DescriptorAllocator(GraphicsDevice device, DescriptorHeapType descriptorHeapType)
-            {
-                this.device = device;
-                this.descriptorHeapType = descriptorHeapType;
-                this.descriptorSize = device.NativeDevice.GetDescriptorHandleIncrementSize(descriptorHeapType);
-            }
-
-            public void Dispose()
-            {
-                currentHeap?.Dispose();
-                currentHeap = null;
-            }
-
-            public CpuDescriptorHandle Allocate(int count)
-            {
-                if (currentHeap == null || remainingHandles < count)
-                {
-                    currentHeap = device.NativeDevice.CreateDescriptorHeap(new DescriptorHeapDescription
-                    {
-                        Flags = DescriptorHeapFlags.None,
-                        Type = descriptorHeapType,
-                        DescriptorCount = DescriptorPerHeap,
-                        NodeMask = 1,
-                    });
-                    remainingHandles = DescriptorPerHeap;
-                    currentHandle = currentHeap.CPUDescriptorHandleForHeapStart;
-                }
-
-                var result = currentHandle;
-
-                currentHandle.Ptr += descriptorSize;
-                remainingHandles -= count;
-
-                return result;
             }
         }
     }

@@ -2,6 +2,7 @@
 // Distributed under the MIT license. See the LICENSE.md file in the project root for more information.
 #if STRIDE_GRAPHICS_API_DIRECT3D 
 using SharpDX.Direct3D;
+using Silk.NET.Core.Native;
 
 namespace Stride.Graphics
 {
@@ -30,9 +31,9 @@ namespace Stride.Graphics
         /// Returns a GraphicsProfile from a FeatureLevel.
         /// </summary>
         /// <returns>associated GraphicsProfile</returns>
-        public static FeatureLevel ToFeatureLevel(this GraphicsProfile profile)
+        public static D3DFeatureLevel ToFeatureLevel(this GraphicsProfile profile)
         {
-            return (FeatureLevel)profile;
+            return (D3DFeatureLevel)profile;
         }
 
         /// <summary>
