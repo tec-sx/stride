@@ -1,19 +1,19 @@
 using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Runtime.InteropServices;
 using Silk.NET.Core.Native;
 using Silk.NET.Direct3D12;
-using Stride.Core.Collections;
 
 namespace Stride.Graphics.Direct3D12
 {
     internal unsafe sealed class CommandQueue : IDisposable
     {
-
+        private ulong lastCompletedFence;
+        
         public GraphicsDevice Device { get; }
 
         public ComPtr<ID3D12CommandQueue> NativeCommandQueue { get; }
+
+        public ComPtr<ID3D12CommandQueue> NativeCopyCommandQueue { get; }
 
         public ComPtr<ID3D12Fence> Fence { get; }
         
@@ -24,7 +24,8 @@ namespace Stride.Graphics.Direct3D12
         public CommandQueue(GraphicsDevice device, CommandListType commandListType)
         {
             Device = device;
-            NativeCommandQueue = new(CreateCommandQueue(commandListType));
+            ID3D12CommandQueue* pNativeCommandQueue = CreateCommandQueue(commandListType);
+            NativeCommandQueue = new(pNativeCommandQueue);
             Fence = new(CreateFence());
             FenceEvent = CreateFenceEvent();
         }
@@ -42,28 +43,6 @@ namespace Stride.Graphics.Direct3D12
             
             Fence.Dispose();
         }
-
-        //public void ExecuteCommandLists(params CompiledCommandList[] commandLists)
-        //{
-        //    ExecuteCommandLists(commandLists.AsEnumerable());
-        //}
-
-        //public void ExecuteCommandLists(FastList<CompiledCommandList> commandLists)
-        //{
-        //    ExecuteCommandLists(commandLists.AsEnumerable());
-        //}
-
-        //public void ExecuteCommandLists(IEnumerable<CompiledCommandList> commandLists)
-        //{
-        //    if (commandLists.Count() == 0)
-        //    {
-        //        return;
-        //    }
-
-        //    ulong fenceValue = ExecuteCommandListsInternal(commandLists);
-
-        //    WaitForFence(Fence, fenceValue);
-        //}
 
         public bool FenceIsComplete(ID3D12Fence* fence, ulong fenceValue)
         {
@@ -139,82 +118,76 @@ namespace Stride.Graphics.Direct3D12
         /// <param name="commandLists">The deferred command lists.</param>
         public ulong ExecuteCommandLists(int count, CompiledCommandList[] commandLists)
         {
-            if (commandLists == null)
-            {
-                throw new ArgumentNullException(nameof(commandLists));
-            }
-
-            if (count > commandLists.Length)
-            {
-                throw new ArgumentOutOfRangeException(nameof(count));
-            }
-
             ulong fenceValue = NextFenceValue++;
 
-            // Recycle resources
-            for (int index = 0; index < count; index++)
+            ID3D12CommandList** ppCommandList = stackalloc ID3D12CommandList*[count];
+            
+            for (int i = 0; i < count; i++)
             {
-                CompiledCommandList commandList = commandLists[index];
-
-                nativeCommandLists.Add(commandList.NativeCommandList);
-                RecycleCommandListResources(commandList, fenceValue);
+                ppCommandList[i] = (ID3D12CommandList*)commandLists[i].NativeCommandList.Handle;
             }
-
-            ID3D12CommandList** ppCommandList = stackalloc ID3D12CommandList*[]
-            {
-                (ID3D12CommandList*[])comList
-            };
 
             // Submit and signal fence
 
             NativeCommandQueue.Get().ExecuteCommandLists(1, ppCommandList);
             NativeCommandQueue.Get().Signal(Fence, fenceValue);
 
-            Device.RecycleCommandListResources(commandList, fenceValue);
-
             return fenceValue;
         }
 
-        internal ulong ExecuteCommandListInternal(CompiledCommandList commandList)
+        internal ulong ExecuteCommandList(CompiledCommandList commandList)
         {
+            const int count = 1;
             ulong fenceValue = NextFenceValue++;
             
-            ID3D12CommandList** ppCommandList = stackalloc ID3D12CommandList*[1]
+            ID3D12CommandList** ppCommandList = stackalloc ID3D12CommandList*[count]
             {
                 (ID3D12CommandList*)commandList.NativeCommandList.Handle
             };
 
             // Submit and signal fence
 
-            NativeCommandQueue.Get().ExecuteCommandLists(1, ppCommandList);
+            NativeCommandQueue.Get().ExecuteCommandLists(count, ppCommandList);
             NativeCommandQueue.Get().Signal(Fence, fenceValue);
-
-            Device.RecycleCommandListResources(commandList, fenceValue);
 
             return fenceValue;
         }
 
-        internal bool IsFenceCompleteInternal(long fenceValue)
+        internal bool IsFenceComplete(ulong fenceValue)
         {
             // Try to avoid checking the fence if possible
             if (fenceValue > lastCompletedFence)
-                lastCompletedFence = Math.Max(lastCompletedFence, nativeFence.CompletedValue); // Protect against race conditions
+            {
+                // Protect against race conditions
+                lastCompletedFence = Math.Max(lastCompletedFence, Fence.Get().GetCompletedValue());
+            }
 
             return fenceValue <= lastCompletedFence;
         }
 
-        internal void WaitForFenceInternal(long fenceValue)
+        internal void WaitForFence(ulong fenceValue)
         {
-            if (IsFenceCompleteInternal(fenceValue))
-                return;
-
-            // TODO D3D12 in case of concurrency, this lock could end up blocking too long a second thread with lower fenceValue then first one
-            lock (nativeFence)
+            if (IsFenceComplete(fenceValue))
             {
-                nativeFence.SetEventOnCompletion(fenceValue, fenceEvent.SafeWaitHandle.DangerousGetHandle());
-                fenceEvent.WaitOne();
-                lastCompletedFence = fenceValue;
+                return;
             }
+
+            ID3D12Fence* nativeFence = Fence.Handle;
+
+            // TODO D3D12 in case of concurrency, this lock could end up blocking too
+            // long a second thread with lower fenceValue then first one
+            
+            Fence.Get().SetEventOnCompletion(fenceValue, FenceEvent.ToPointer());
+            _ = SilkMarshal.WaitWindowsObjects(FenceEvent);
+            lastCompletedFence = fenceValue;
+        }
+
+        internal void WaitCopyQueue()
+        {
+            NativeCommandQueue.Get().ExecuteCommandList(NativeCopyCommandList);
+            NativeCommandQueue.Get().Signal(nativeCopyFence, nextCopyFenceValue);
+            NativeCommandQueue.Get().Wait(nativeCopyFence, nextCopyFenceValue);
+            nextCopyFenceValue++;
         }
     }
 }

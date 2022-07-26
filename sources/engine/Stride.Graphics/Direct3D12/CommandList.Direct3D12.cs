@@ -4,15 +4,15 @@
 using System;
 using System.Collections.Generic;
 using System.Threading;
-using SharpDX;
-using SharpDX.Direct3D12;
 using SharpDX.Mathematics.Interop;
+using Silk.NET.Core.Native;
+using Silk.NET.Direct3D12;
 using Stride.Core.Mathematics;
 using Utilities = Stride.Core.Utilities;
 
 namespace Stride.Graphics
 {
-    public partial class CommandList
+    public unsafe partial class CommandList
     {
         private DescriptorHeapCache srvHeap;
         private int srvHeapOffset = GraphicsDevice.SrvHeapSize;
@@ -20,13 +20,13 @@ namespace Stride.Graphics
         private int samplerHeapOffset = GraphicsDevice.SamplerHeapSize;
 
         private PipelineState boundPipelineState;
-        private readonly DescriptorHeap[] descriptorHeaps = new DescriptorHeap[2];
+        private readonly ID3D12DescriptorHeap[] descriptorHeaps = new ID3D12DescriptorHeap[2];
         private readonly List<ResourceBarrier> resourceBarriers = new List<ResourceBarrier>(16);
 
         private readonly Dictionary<long, GpuDescriptorHandle> srvMapping = new Dictionary<long, GpuDescriptorHandle>();
         private readonly Dictionary<long, GpuDescriptorHandle> samplerMapping = new Dictionary<long, GpuDescriptorHandle>();
 
-        internal readonly Queue<GraphicsCommandList> NativeCommandLists = new Queue<GraphicsCommandList>();
+        internal readonly Queue<ComPtr<ID3D12GraphicsCommandList>> NativeCommandLists = new ();
 
         private CompiledCommandList currentCommandList;
         
@@ -47,7 +47,8 @@ namespace Stride.Graphics
             if (NativeCommandLists.Count > 0)
             {
                 currentCommandList.NativeCommandList = NativeCommandLists.Dequeue();
-                currentCommandList.NativeCommandList.Reset(currentCommandList.NativeCommandAllocator, null);
+                ID3D12CommandAllocator commandAllocator = currentCommandList.NativeCommandAllocator.Get();
+                currentCommandList.NativeCommandList.Get().Reset(ref commandAllocator, null);
             }
             else
             {

@@ -3,13 +3,11 @@
 
 #if STRIDE_GRAPHICS_API_DIRECT3D12
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
 using Silk.NET.Core.Native;
 using Silk.NET.Direct3D12;
 using Silk.NET.DXGI;
-using Stride.Core.Collections;
 using Stride.Core.Threading;
 using Stride.Graphics.Direct3D;
 using Stride.Graphics.Direct3D12;
@@ -21,29 +19,30 @@ namespace Stride.Graphics
         // D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT (not exposed by SharpDX)
         internal readonly int ConstantBufferDataPlacementAlignment = 256;
 
+        private const GraphicsPlatform GraphicPlatform = GraphicsPlatform.Direct3D12;
         private D3D12 d3d12;
         private DXGI dxgi;
+        private ID3D12Device* nativeDevice;
 
-        private const GraphicsPlatform GraphicPlatform = GraphicsPlatform.Direct3D12;
+        private ID3D12Resource* nativeUploadBuffer;
+        private IntPtr nativeUploadBufferStart;
+        private int nativeUploadBufferOffset;
 
-        internal readonly ConcurrentPool<List<GraphicsResource>> StagingResourceLists = new ConcurrentPool<List<GraphicsResource>>(() => new List<GraphicsResource>());
-        internal readonly ConcurrentPool<List<ID3D12DescriptorHeap>> DescriptorHeapLists = new (() => new List<ID3D12DescriptorHeap>());
+        internal readonly ConcurrentPool<List<GraphicsResource>> StagingResourceLists = new (() => new List<GraphicsResource>());
+        internal readonly ConcurrentPool<List<ComPtr<ID3D12DescriptorHeap>>> DescriptorHeapLists = new (() => new List<ComPtr<ID3D12DescriptorHeap>>());
 
         private bool simulateReset = false;
         private string rendererName;
 
-        private ComPtr<ID3D12Device> nativeDevice;
-        internal ComPtr<ID3D12CommandQueue> NativeCommandQueue;
 
         internal CommandQueue CommandQueue;
 
         internal GraphicsProfile RequestedProfile;
         internal D3DFeatureLevel CurrentFeatureLevel;
 
-        internal ComPtr<ID3D12CommandQueue> NativeCopyCommandQueue;
         internal ComPtr<ID3D12CommandAllocator> NativeCopyCommandAllocator;
         internal ComPtr<ID3D12GraphicsCommandList> NativeCopyCommandList;
-        private ID3D12Fence nativeCopyFence;
+        private ComPtr<ID3D12Fence> nativeCopyFence;
         private long nextCopyFenceValue = 1;
 
         internal CommandAllocatorPool CommandAllocators;
@@ -58,27 +57,19 @@ namespace Stride.Graphics
         internal DescriptorAllocator DepthStencilViewAllocator;
         internal DescriptorAllocator RenderTargetViewAllocator;
 
-        private ComPtr<ID3D12Resource> nativeUploadBuffer;
-        private IntPtr nativeUploadBufferStart;
-        private int nativeUploadBufferOffset;
+        internal uint SrvHandleIncrementSize;
+        internal uint SamplerHandleIncrementSize;
 
-        internal int SrvHandleIncrementSize;
-        internal int SamplerHandleIncrementSize;
 
-        private ID3D12Fence nativeFence;
-        private long lastCompletedFence;
-        internal ulong NextFenceValue = 1;
         private AutoResetEvent fenceEvent = new AutoResetEvent(false);
 
         // Temporary or destroyed resources kept around until the GPU doesn't need them anymore
         internal Queue<KeyValuePair<long, object>> TemporaryResources = new Queue<KeyValuePair<long, object>>();
 
-        private readonly FastList<ComPtr<ID3D12GraphicsCommandList>> nativeCommandLists = new ();
-
         /// <summary>
         /// The tick frquency of timestamp queries in Hertz.
         /// </summary>
-        public long TimestampFrequency { get; private set; }
+        public ulong TimestampFrequency { get; private set; }
 
         /// <summary>
         ///     Gets the status of this device.
@@ -145,7 +136,9 @@ namespace Stride.Graphics
         /// <param name="commandList">The deferred command list.</param>
         public void ExecuteCommandList(CompiledCommandList commandList)
         {
-            ulong fenceValue = ExecuteCommandListInternal(commandList);
+            ulong fenceValue = CommandQueue.ExecuteCommandList(commandList);
+
+            RecycleCommandListResources(commandList, fenceValue);
         }
 
         /// <summary>
@@ -165,29 +158,16 @@ namespace Stride.Graphics
                 throw new ArgumentOutOfRangeException(nameof(count));
             }
 
-            ulong fenceValue = NextFenceValue++;
+            ulong fenceValue = CommandQueue.ExecuteCommandLists(count, commandLists);
 
-            // Recycle resources
-            for (int index = 0; index < count; index++)
+            for (int i = 0; i < count; i++)
             {
-                CompiledCommandList commandList = commandLists[index];
+                CompiledCommandList commandList = commandLists[i];
 
-                nativeCommandLists.Add(commandList.NativeCommandList);
                 RecycleCommandListResources(commandList, fenceValue);
             }
 
-            // Submit and signal fence
-            var ppCommandLists = stackalloc ComPtr<ID3D12CommandList>[count]
-            {
-                (ID3D12CommandList*)nativeCommandLists.To
-            };
-
-            NativeCommandQueue.Get().ExecuteCommandLists(count, nativeCommandLists.Items);
-            NativeCommandQueue.Get().Signal(Fence, fenceValue);
-
             ReleaseTemporaryResources();
-
-            nativeCommandLists.Clear();
         }
 
         public void SimulateReset()
@@ -221,6 +201,7 @@ namespace Stride.Graphics
             {
                 SrvHeaps.RecycleObject(fenceValue, heap);
             }
+
             commandList.SrvHeaps.Clear();
             DescriptorHeapLists.Release(commandList.SrvHeaps);
 
@@ -228,11 +209,120 @@ namespace Stride.Graphics
             {
                 SamplerHeaps.RecycleObject(fenceValue, heap);
             }
+
             commandList.SamplerHeaps.Clear();
             DescriptorHeapLists.Release(commandList.SamplerHeaps);
 
             commandList.Builder.NativeCommandLists.Enqueue(commandList.NativeCommandList);
             CommandAllocators.RecycleObject(fenceValue, commandList.NativeCommandAllocator);
+        }
+
+        private bool TryEnableDebugLayer(DeviceCreationFlags deviceCreationFlags)
+        {
+            using ComPtr<ID3D12Debug> debugController = null;
+            Guid iid = ID3D12Debug.Guid;
+            int hResult = d3d12.GetDebugInterface(&iid, (void**)&debugController);
+
+            if (HResult.IndicatesSuccess(hResult))
+            {
+                debugController.Get().EnableDebugLayer();
+
+                return true;
+            }
+            else
+            {
+                return false;
+            }
+        }
+        private void SetupDebugMessages()
+        {
+            Guid debugDeviceIID = ID3D12DebugDevice.Guid;
+            ID3D12DebugDevice* pDebugDevice;
+            int debugDeviceHResult = nativeDevice->QueryInterface(&debugDeviceIID, (void**)&pDebugDevice);
+
+            SilkMarshal.ThrowHResult(debugDeviceHResult);
+
+            Guid infoQueueIID = ID3D12InfoQueue.Guid;
+            ID3D12InfoQueue* pInfoQueue;
+            int infoQueueHResult = pDebugDevice->QueryInterface(&infoQueueIID, (void**)&pInfoQueue);
+
+            SilkMarshal.ThrowHResult(infoQueueHResult);
+
+            MessageID* disabledMessages = stackalloc MessageID[]
+            {
+                // This happens when render target or depth stencil clear value is diffrent
+                // than provided during resource allocation.
+                MessageID.MessageIDCleardepthstencilviewMismatchingclearvalue,
+                MessageID.MessageIDClearrendertargetviewMismatchingclearvalue,
+
+                // This occurs when there are uninitialized descriptors in a descriptor table,
+                // even when a shader does not access the missing descriptors.
+                MessageID.MessageIDInvalidDescriptorHandle,
+                        
+                // These happen when capturing with VS diagnostics
+                MessageID.MessageIDMapInvalidNullrange,
+                MessageID.MessageIDUnmapInvalidNullrange,
+            };
+
+            // Disable irrelevant debug layer warnings
+
+            Silk.NET.Direct3D12.InfoQueueFilter filter = new ()
+            {
+                DenyList = new Silk.NET.Direct3D12.InfoQueueFilterDesc
+                {
+                    PIDList = disabledMessages
+                }
+            };
+
+            pInfoQueue->AddStorageFilterEntries(&filter);
+
+            //infoQueue.SetBreakOnSeverity(MessageSeverity.Error, true);
+            //infoQueue.SetBreakOnSeverity(MessageSeverity.Warning, true);
+
+            pInfoQueue->Release();
+            pDebugDevice->Release();
+        }
+
+
+        /// <summary>
+        /// Creates Device D3D12 with feature Level based on profile
+        /// </summary>
+        /// <param name="graphicsProfiles"></param>
+        private void CreateD3D12Device(GraphicsProfile[] graphicsProfiles)
+        {
+            for (int index = 0; index < graphicsProfiles.Length; index++)
+            {
+                GraphicsProfile graphicsProfile = graphicsProfiles[index];
+                try
+                {
+                    // D3D12 supports only feature level 11+
+                    D3DFeatureLevel level = graphicsProfile.ToFeatureLevel();
+
+                    if (level < D3DFeatureLevel.D3DFeatureLevel110)
+                    {
+                        level = D3DFeatureLevel.D3DFeatureLevel110;
+                    }
+
+                    ID3D12Device* d3dDevice;
+                    Guid deviceIID = ID3D12Device.Guid;
+                    D3DFeatureLevel minFeatureLevel = D3DFeatureLevel.D3DFeatureLevel110;
+                    IUnknown* adapter = (IUnknown*)Adapter.NativeAdapter.GetAddressOf();
+                    int hResult = d3d12.CreateDevice(adapter, minFeatureLevel, &deviceIID, (void**)&d3dDevice);
+
+                    SilkMarshal.ThrowHResult(hResult);
+
+                    nativeDevice = d3dDevice;
+
+                    RequestedProfile = graphicsProfile;
+                    CurrentFeatureLevel = level;
+                    break;
+                }
+                catch (Exception)
+                {
+                    if (index == graphicsProfiles.Length - 1)
+                        throw;
+                }
+            }
         }
 
         /// <summary>
@@ -246,7 +336,7 @@ namespace Stride.Graphics
             d3d12 = D3D12.GetApi();
             dxgi = DXGI.GetApi();
 
-            if (nativeDevice.Handle != null)
+            if (nativeDevice != null)
             {
                 // Destroy previous device
                 ReleaseDevice();
@@ -266,148 +356,99 @@ namespace Stride.Graphics
 
             if (isDebug)
             {
-                using ComPtr<ID3D12Debug> debugController = null;
-                Guid iid = ID3D12Debug.Guid;
-                int hResult = d3d12.GetDebugInterface(&iid, (void**)&debugController);
-
-                if (HResult.IndicatesSuccess(hResult))
-                {
-                    debugController.Get().EnableDebugLayer();
-                }
-                else
-                {
-                    isDebug = false;
-                }
+                isDebug = TryEnableDebugLayer(deviceCreationFlags);
             }
 
-            // Create Device D3D12 with feature Level based on profile
-            for (int index = 0; index < graphicsProfiles.Length; index++)
-            {
-                GraphicsProfile graphicsProfile = graphicsProfiles[index];
-                try
-                {
-                    // D3D12 supports only feature level 11+
-                    D3DFeatureLevel level = graphicsProfile.ToFeatureLevel();
-
-                    if (level < D3DFeatureLevel.D3DFeatureLevel110)
-                    {
-                        level = D3DFeatureLevel.D3DFeatureLevel110;
-                    }
-
-                    ID3D12Device* d3dDevice;
-                    Guid deviceIID = ID3D12Device.Guid;
-                    D3DFeatureLevel minFeatureLevel = D3DFeatureLevel.D3DFeatureLevel110;
-                    IUnknown* adapter = (IUnknown*)Adapter.NativeAdapter.GetAddressOf();
-                    int deviceHResult = d3d12.CreateDevice(adapter, minFeatureLevel, &deviceIID, (void**)&d3dDevice);
-                    
-                    SilkMarshal.ThrowHResult(deviceHResult);
-
-                    nativeDevice = d3dDevice;
-
-                    RequestedProfile = graphicsProfile;
-                    CurrentFeatureLevel = level;
-                    break;
-                }
-                catch (Exception)
-                {
-                    if (index == graphicsProfiles.Length - 1)
-                        throw;
-                }
-            }
+            CreateD3D12Device(graphicsProfiles);
 
             // Describe and create the command queue.
-            CommandQueueDesc queueDesc = new (CommandListType.CommandListTypeDirect);
-            Guid commandQuquqIID = ID3D12CommandQueue.Guid;
-            ID3D12CommandQueue** pCommandQueue = NativeCommandQueue.GetAddressOf();
-            int commandQueueHResult = nativeDevice.Get().CreateCommandQueue(&queueDesc, &commandQuquqIID, (void**)pCommandQueue);
+            CommandQueue = new(this, CommandListType.CommandListTypeDirect);
 
-            SilkMarshal.ThrowHResult(commandQueueHResult);
+            ulong* pFrequency = null;
+            int frequencyHResult = CommandQueue.NativeCommandQueue.Get().GetTimestampFrequency(pFrequency);
 
-            //queueDesc.Type = CommandListType.Copy;
-            NativeCopyCommandQueue = nativeDevice.CreateCommandQueue(queueDesc);
-            TimestampFrequency = NativeCommandQueue.TimestampFrequency;
+            SilkMarshal.ThrowHResult(frequencyHResult);
 
-            SrvHandleIncrementSize = NativeDevice.GetDescriptorHandleIncrementSize(DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
-            SamplerHandleIncrementSize = NativeDevice.GetDescriptorHandleIncrementSize(DescriptorHeapType.Sampler);
+            TimestampFrequency = *pFrequency;
+
+            SrvHandleIncrementSize = nativeDevice
+                ->GetDescriptorHandleIncrementSize(DescriptorHeapType.DescriptorHeapTypeCbvSrvUav);
+
+            SamplerHandleIncrementSize = nativeDevice
+                ->GetDescriptorHandleIncrementSize(DescriptorHeapType.DescriptorHeapTypeSampler);
+
 
             if (isDebug)
             {
-                var debugDevice = nativeDevice.QueryInterfaceOrNull<DebugDevice>();
-                if (debugDevice != null)
-                {
-                    var infoQueue = debugDevice.QueryInterfaceOrNull<InfoQueue>();
-                    if (infoQueue != null)
-                    {
-                        MessageId[] disabledMessages =
-                        {
-                            // This happens when render target or depth stencil clear value is diffrent
-                            // than provided during resource allocation.
-                            MessageId.CleardepthstencilviewMismatchingclearvalue,
-                            MessageId.ClearrendertargetviewMismatchingclearvalue,
-
-                            // This occurs when there are uninitialized descriptors in a descriptor table,
-                            // even when a shader does not access the missing descriptors.
-                            MessageId.InvalidDescriptorHandle,
-                            
-                            // These happen when capturing with VS diagnostics
-                            MessageId.MapInvalidNullRange,
-                            MessageId.UnmapInvalidNullRange,
-                        };
-
-                        // Disable irrelevant debug layer warnings
-                        InfoQueueFilter filter = new InfoQueueFilter
-                        {
-                            DenyList = new InfoQueueFilterDescription
-                            {
-                                Ids = disabledMessages
-                            }
-                        };
-                        infoQueue.AddStorageFilterEntries(filter);
-
-                        //infoQueue.SetBreakOnSeverity(MessageSeverity.Error, true);
-                        //infoQueue.SetBreakOnSeverity(MessageSeverity.Warning, true);
-
-                        infoQueue.Dispose();
-                    }
-                    debugDevice.Dispose();
-                }
+                SetupDebugMessages();
             }
 
             // Prepare pools
             CommandAllocators = new CommandAllocatorPool(this);
-            SrvHeaps = new HeapPool(this, SrvHeapSize, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
-            SamplerHeaps = new HeapPool(this, SamplerHeapSize, DescriptorHeapType.Sampler);
+            SrvHeaps = new HeapPool(this, SrvHeapSize, DescriptorHeapType.DescriptorHeapTypeCbvSrvUav);
+            SamplerHeaps = new HeapPool(this, SamplerHeapSize, DescriptorHeapType.DescriptorHeapTypeSampler);
 
             // Prepare descriptor allocators
-            SamplerAllocator = new DescriptorAllocator(this, DescriptorHeapType.Sampler);
-            ShaderResourceViewAllocator = new DescriptorAllocator(this, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
-            DepthStencilViewAllocator = new DescriptorAllocator(this, DescriptorHeapType.DepthStencilView);
-            RenderTargetViewAllocator = new DescriptorAllocator(this, DescriptorHeapType.RenderTargetView);
+            SamplerAllocator = new DescriptorAllocator(this, DescriptorHeapType.DescriptorHeapTypeSampler);
+            ShaderResourceViewAllocator = new DescriptorAllocator(this, DescriptorHeapType.DescriptorHeapTypeCbvSrvUav);
+            DepthStencilViewAllocator = new DescriptorAllocator(this, DescriptorHeapType.DescriptorHeapTypeDsv);
+            RenderTargetViewAllocator = new DescriptorAllocator(this, DescriptorHeapType.DescriptorHeapTypeRtv);
 
             // Prepare copy command list (start it closed, so that every new use start with a Reset)
-            NativeCopyCommandAllocator = NativeDevice.CreateCommandAllocator(CommandListType.Direct);
-            NativeCopyCommandList = NativeDevice.CreateCommandList(CommandListType.Direct, NativeCopyCommandAllocator, null);
-            NativeCopyCommandList.Close();
+            Guid commandAllocatorIID = ID3D12CommandAllocator.Guid;
+            ID3D12CommandAllocator* pCommandAllocator;
+            int commandAllocatorHResult = NativeDevice.Get().CreateCommandAllocator(
+                CommandListType.CommandListTypeDirect,
+                &commandAllocatorIID,
+                (void**)&pCommandAllocator);
+
+            SilkMarshal.ThrowHResult(commandAllocatorHResult);
+
+            NativeCopyCommandAllocator = new(pCommandAllocator);
+
+            Guid commandListIID = ID3D12CommandList.Guid;
+            ID3D12CommandList* pCommandList;
+            int commandListHResult = NativeDevice.Get().CreateCommandList(
+                nodeMask: 0,
+                CommandListType.CommandListTypeDirect,
+                pCommandAllocator,
+                null,
+                &commandListIID,
+                (void**)&pCommandList);
+
+            NativeCopyCommandList = new((ID3D12GraphicsCommandList*)pCommandList);
+            
+            SilkMarshal.ThrowHResult(NativeCopyCommandList.Get().Close());
 
             // Fence for next frame and resource cleaning
-            nativeFence = NativeDevice.CreateFence(0, FenceFlags.None);
-            nativeCopyFence = NativeDevice.CreateFence(0, FenceFlags.None);
+            ulong initialValue = 0;
+            Guid fenceIID = ID3D12Fence.Guid;
+            ID3D12Fence* pFence = null;
+            int fenceHResult = NativeDevice.Get().CreateFence(initialValue, FenceFlags.FenceFlagNone, &fenceIID, (void**)&pFence);
+
+            SilkMarshal.ThrowHResult(fenceHResult);
+
+            nativeCopyFence = new(pFence);
         }
 
-        internal IntPtr AllocateUploadBuffer(int size, out SharpDX.Direct3D12.Resource resource, out int offset, int alignment = 0)
+        internal IntPtr AllocateUploadBuffer(uint size, out ID3D12Resource resource, out int offset, int alignment = 0)
         {
             // TODO D3D12 thread safety, should we simply use locks?
 
             // Align
             if (alignment > 0)
+            {
                 nativeUploadBufferOffset = (nativeUploadBufferOffset + alignment - 1) / alignment * alignment;
+            }
 
-            if (nativeUploadBuffer == null || nativeUploadBufferOffset + size > nativeUploadBuffer.Description.Width)
+            if (nativeUploadBuffer == null || nativeUploadBufferOffset + size > (uint)nativeUploadBuffer->GetDesc().Width)
             {
                 if (nativeUploadBuffer != null)
                 {
-                    nativeUploadBuffer.Unmap(0);
-                    TemporaryResources.Enqueue(new KeyValuePair<long, object>(NextFenceValue, nativeUploadBuffer));
+
+                    nativeUploadBuffer->Unmap(0, null);
+                    KeyValuePair<long, object> res = new((long)CommandQueue.NextFenceValue, *nativeUploadBuffer);
+                    TemporaryResources.Enqueue(res);
                 }
 
                 // Allocate new buffer
@@ -474,8 +515,7 @@ namespace Stride.Graphics
             NativeCommandQueue.Wait(nativeFence, NextFenceValue);
 
             // Release command queue
-            NativeCommandQueue.Dispose();
-            NativeCommandQueue = null;
+            CommandQueue.Dispose();
 
             NativeCopyCommandQueue.Dispose();
             NativeCopyCommandQueue = null;

@@ -12,8 +12,8 @@ namespace Stride.Graphics
         internal CommandList Builder;
         internal ComPtr<ID3D12GraphicsCommandList> NativeCommandList;
         internal ComPtr<ID3D12CommandAllocator> NativeCommandAllocator;
-        internal List<HeapDesc> SrvHeaps;
-        internal List<HeapDesc> SamplerHeaps;
+        internal List<ComPtr<ID3D12DescriptorHeap>> SrvHeaps;
+        internal List<ComPtr<ID3D12DescriptorHeap>> SamplerHeaps;
         internal List<GraphicsResource> StagingResources;
     }
 }
